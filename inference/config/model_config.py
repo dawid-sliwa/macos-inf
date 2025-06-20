@@ -1,5 +1,7 @@
 from typing import Optional
 
+import torch
+
 from inference.hf_utils import get_config
 
 
@@ -13,3 +15,4 @@ class ModelConfig:
     ):
         self.model_path = model_path
         self.hf_config = get_config(self.model_path)
+        self.dtype: torch.dtype = "auto"

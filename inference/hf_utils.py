@@ -20,6 +20,8 @@ def get_tokenizer(
 
 
 def get_config(model: str) -> AutoConfig:
+    print("trying to download config from hugging face")
     config = AutoConfig.from_pretrained(model)
+    print("downloaded model from hugging face")
 
     return config

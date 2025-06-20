@@ -1,14 +1,33 @@
-
-
-
+import glob
+import os
+from huggingface_hub import snapshot_download
 import torch
+from tqdm import tqdm
+from inference.config.model_config import ModelConfig
 from inference.model_loader.utils import set_default_torch_dtype
+from safetensors.torch import safe_open
+
+class ModelLoader:
+    
+    def _prepare_weights(self, model_name: str):
+        hf_folder = snapshot_download(model_name)
+
+        hf_weights_files: list[str] = glob.glob(os.path.join(hf_folder, "*.safetensors"))
+        
+        return hf_folder, hf_weights_files
+    
+    def get_weights(self, model_name: str):
+        hf_folder, weights_files = self._prepare_weights(model_name)
+        model_params: dict[str, torch.Tensor] = {}
+        for st_file in tqdm(weights_files):
+
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():
+                    param = f.get_tensor(name)
+                    model_params[name] = param
+
+        print(model_params.keys())
 
 
-# class ModelLoader:
-
-
-#     def load_model(self, config: dict):
-
-
-#         with set_default_torch_dtype(torch.dtype.):
+    def load_model(self, config: ModelConfig):
+        self.get_weights(config.model_path)
