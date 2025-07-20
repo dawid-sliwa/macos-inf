@@ -1,17 +1,29 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from inference.config.model_config import ModelConfig
 from inference.engine.async_llm import AsyncLLM
+from inference.openai_protocol import ChatCompletionRequest
 from inference.server_args import ServerArgs
 
 router = APIRouter()
 
 
+def get_engine(request: Request) -> AsyncLLM:
+    return request.app.state.engine
+
+
 @router.get("/health")
 async def health_route():
     return {"status": "ok"}
+
+
+@router.post("/v1/chat")
+async def create_chat_completion(data: ChatCompletionRequest, request: Request):
+    engine = get_engine(request)
+
+    print(await engine.create_chat_completion(request=data))
 
 
 def build_app(args: ServerArgs):
@@ -30,6 +42,7 @@ def build_app(args: ServerArgs):
     config = ModelConfig(model_path=args.model_path)
 
     engine = AsyncLLM(model_config=config)
+    app.state.engine = engine
     return app
 
 
