@@ -24,8 +24,14 @@ class ModelLoader:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():
                     param = f.get_tensor(name)
-                    print(name)
+                    if name == "lm_head.weight":
+                        name = "model.lm_head.weight"
                     model_params[name] = param
 
-    def load_model(self, config: ModelConfig):
-        self.get_weights(config.model_path)
+        return model_params
+
+    def load_model(self, config: ModelConfig, model: torch.nn.Module):
+        weights = self.get_weights(config.model_path)
+
+        info = model.load_state_dict(weights)
+        print(info)

@@ -23,7 +23,7 @@ async def health_route():
 async def create_chat_completion(data: ChatCompletionRequest, request: Request):
     engine = get_engine(request)
 
-    print(await engine.create_chat_completion(request=data))
+    return await engine.create_chat_completion(request=data)
 
 
 def build_app(args: ServerArgs):
