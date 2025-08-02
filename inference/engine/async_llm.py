@@ -21,19 +21,30 @@ class AsyncLLM:
 
     async def create_chat_completion(self, request: ChatCompletionRequest):
         request_prompt = self.tokenizer.apply_chat_template(
-            conversation=request.messages, add_generation_prompt=True, enable_thinking=False
+            conversation=request.messages,
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
         eos_id = self.tokenizer.eos_token_id
-        
 
-
+        # prefill with initial input prompt getting back logits of new token
         input_tensor = torch.tensor(request_prompt).unsqueeze(0)
+        positions_ids = torch.arange(input_tensor.shape[1]).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.model(input_tensor, positions_ids, True)
 
+        logits = logits[:, -1, :]
+        idx_next = torch.argmax(logits, dim=-1, keepdim=True)
 
-        for _ in range(128):
+        input_tensor = torch.cat((input_tensor, idx_next), dim=1)
+        seq_len = input_tensor.shape[1]
+
+        for idx in range(16):
+            positions_ids = torch.tensor([[seq_len + idx]])
+            input_idx = input_tensor[:, -1].unsqueeze(0)
             with torch.no_grad():
-                logits = self.model(input_tensor)
-            
+                logits = self.model(input_idx, positions_ids, False)
+
             logits = logits[:, -1, :]
 
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)
@@ -44,4 +55,3 @@ class AsyncLLM:
             input_tensor = torch.cat((input_tensor, idx_next), dim=1)
 
         return self.tokenizer.decode(input_tensor.squeeze(0).tolist())
-        
