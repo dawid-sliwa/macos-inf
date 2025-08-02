@@ -1,3 +1,5 @@
+import time
+from typing import Optional
 from torch import nn
 import torch
 from inference.config.model_config import ModelConfig
@@ -29,20 +31,22 @@ def compute_rope_params(
     return cos, sin
 
 
-def apply_rope(x: torch.Tensor, position_embeddings: torch.Tensor):
-    cos, sin = position_embeddings
-    _, _, seq_len, head_dim = x.shape
+def apply_rope(
+    x: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    position_ids: torch.LongTensor,
+):
+    if position_ids.dim() > 1:
+        position_ids = position_ids.view(-1)
+    cos_table, sin_table = position_embeddings
 
-    x1 = x[..., : head_dim // 2]
-    x2 = x[..., head_dim // 2 :]
+    cos = cos_table[position_ids].unsqueeze(0).unsqueeze(0)
+    sin = sin_table[position_ids].unsqueeze(0).unsqueeze(0)
+
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     rotated = torch.cat((-x2, x1), dim=-1)
 
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
-
-    x_rotated = (x * cos) + (rotated * sin)
-
-    return x_rotated.to(dtype=x.dtype)
+    return (x * cos + rotated * sin).to(dtype=x.dtype)
 
 
 class RMSNorm(nn.Module):
@@ -110,6 +114,9 @@ class Attention(nn.Module):
         x: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+        layer_idx: int,
+        cache_positions: Optional[torch.LongTensor] = None,
     ):
         bsz, seq_len, _ = x.shape
 
@@ -130,31 +137,44 @@ class Attention(nn.Module):
         queries = self.q_norm(queries)
         keys = self.k_norm(keys)
 
-        queries = apply_rope(queries, position_embeddings)
-        keys = apply_rope(keys, position_embeddings)
+        if cache_positions is None:
+            # full‐sequence prefill
+            positions = torch.arange(seq_len, device=x.device)
+        else:
+            # autoregressive decoding
+            positions = cache_positions  # shape [q_len]
 
-        keys = keys.repeat_interleave(self.num_kv_groups, dim=1)
-        values = values.repeat_interleave(self.num_kv_groups, dim=1)
+        queries = apply_rope(queries, position_embeddings, positions)
+        keys = apply_rope(keys, position_embeddings, positions)
 
-        attn_score = queries @ keys.transpose(2, 3)
-        attn_score = attn_score.masked_fill(attention_mask, -torch.inf)
-        attn_weight = torch.nn.functional.softmax(
-            attn_score / (self.head_dim ** 0.5), dim=-1, dtype=torch.float32
-        ).to(queries.dtype)
+        k_cache, v_cache = cache
 
-        attn_output = (
-            (attn_weight @ values)
-            .transpose(1, 2)
-            .reshape(bsz, seq_len, self.num_attention_heads * self.head_dim)
+        k_cache[layer_idx, :, positions, :, :] = keys.permute(0, 2, 1, 3)
+        v_cache[layer_idx, :, positions, :, :] = values.permute(0, 2, 1, 3)
+
+        K = int(positions.max().item()) + 1
+        k_all = k_cache[layer_idx, :, :K, :, :]
+        v_all = v_cache[layer_idx, :, :K, :, :]
+
+        keys = k_all.permute(0, 2, 1, 3).repeat_interleave(self.num_kv_groups, dim=1)
+        values = v_all.permute(0, 2, 1, 3).repeat_interleave(self.num_kv_groups, dim=1)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            queries, keys, values, attn_mask=None, is_causal=True
+        )
+
+        attn_output = attn_output.transpose(1, 2).reshape(
+            bsz, seq_len, self.num_attention_heads * self.head_dim
         )
 
         return self.o_proj(attn_output)
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, *, config: AutoConfig):
+    def __init__(self, *, config: AutoConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.self_attn = Attention(config=config)
         self.mlp = FeedForward(config=config)
@@ -169,11 +189,20 @@ class Qwen3DecoderLayer(nn.Module):
         x: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+        cache_positions: Optional[torch.LongTensor],
     ):
         residual = x
         x = self.input_layernorm(x)
 
-        x = self.self_attn(x, position_embeddings, attention_mask)
+        x = self.self_attn(
+            x,
+            position_embeddings,
+            attention_mask,
+            cache,
+            self.layer_idx,
+            cache_positions,
+        )
         x = residual + x
 
         residual = x
@@ -195,8 +224,8 @@ class Qwen3Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                Qwen3DecoderLayer(config=self.config)
-                for _ in range(self.config.num_hidden_layers)
+                Qwen3DecoderLayer(config=self.config, layer_idx=idx)
+                for idx in range(self.config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps)
@@ -210,17 +239,43 @@ class Qwen3Model(nn.Module):
             context_length=self.config.max_position_embeddings,
         )
 
-    def forward(self, in_idx):
-        token_embeddings = self.embed_tokens(in_idx)
-        x = token_embeddings
-
-        seq_len = x.shape[1]
-        mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+        self.register_buffer(
+            "k_cache",
+            torch.zeros(
+                (
+                    self.config.num_hidden_layers,
+                    1,
+                    self.config.max_position_embeddings,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                )
+            ),
+        )
+        self.register_buffer(
+            "v_cache",
+            torch.zeros(
+                (
+                    self.config.num_hidden_layers,
+                    1,
+                    self.config.max_position_embeddings,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                )
+            ),
         )
 
+    def forward(self, in_idx, position_ids: torch.LongTensor, use_cache: bool = False):
+        token_embeddings = self.embed_tokens(in_idx)
+        x = token_embeddings
+        attention_mask = None
         for layer in self.layers:
-            x = layer(x, self.position_embeddings, mask)
+            x = layer(
+                x,
+                self.position_embeddings,
+                attention_mask,
+                (self.k_cache, self.v_cache),
+                position_ids,
+            )
 
         x = self.norm(x)
         logits = self.lm_head(x)
@@ -234,5 +289,7 @@ class Qwen3ModelInstance(nn.Module):
         self.config = config.hf_config
         self.model = Qwen3Model(config=self.config)
 
-    def forward(self, idx: torch.Tensor):
-        return self.model(idx)
+    def forward(
+        self, idx: torch.Tensor, position_ids: torch.LongTensor, use_cache=False
+    ):
+        return self.model(idx, position_ids, use_cache)

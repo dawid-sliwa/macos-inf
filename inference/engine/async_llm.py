@@ -1,3 +1,4 @@
+import time
 from typing import Union
 
 import torch
@@ -21,19 +22,26 @@ class AsyncLLM:
 
     async def create_chat_completion(self, request: ChatCompletionRequest):
         request_prompt = self.tokenizer.apply_chat_template(
-            conversation=request.messages, add_generation_prompt=True, enable_thinking=False
+            conversation=request.messages,
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
         eos_id = self.tokenizer.eos_token_id
-        
-
 
         input_tensor = torch.tensor(request_prompt).unsqueeze(0)
+        seq_len = input_tensor.shape[1]
+        initial_position_ids = torch.arange(seq_len).unsqueeze(0)
+        with torch.no_grad():
+            _ = self.model(input_tensor, initial_position_ids, use_cache=True)
 
+        start = time.time()
+        for _ in range(32):
+            last_idx = input_tensor[:, -1:].clone()
+            cur_pos_id = torch.tensor([input_tensor.size(1)])
 
-        for _ in range(128):
             with torch.no_grad():
-                logits = self.model(input_tensor)
-            
+                logits = self.model(last_idx, cur_pos_id, use_cache=True)
+
             logits = logits[:, -1, :]
 
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)
@@ -43,5 +51,6 @@ class AsyncLLM:
 
             input_tensor = torch.cat((input_tensor, idx_next), dim=1)
 
+        print(f"generation took: {time.time() - start}")
+
         return self.tokenizer.decode(input_tensor.squeeze(0).tolist())
-        
