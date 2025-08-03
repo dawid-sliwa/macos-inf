@@ -41,15 +41,13 @@ def apply_rope(
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
 
-    head_dim = x.shape[-1]
+    head_dim = x.size(-1)
 
     x1 = x[..., : head_dim // 2]
     x2 = x[..., head_dim // 2 :]
     rotated = torch.cat((-x2, x1), dim=-1)
 
-    x_rotated = (x * cos) + (rotated * sin)
-
-    return x_rotated.to(dtype=x.dtype)
+    return (x * cos) + (rotated * sin)
 
 
 class RMSNorm(nn.Module):
@@ -160,7 +158,7 @@ class Attention(nn.Module):
 
         attn_output = (
             torch.nn.functional.scaled_dot_product_attention(
-                queries, keys, values, attn_mask=None, is_causal=True
+                queries, keys, values, attn_mask=None, is_causal=prefill
             )
             .transpose(1, 2)
             .reshape(bsz, seq_len, self.num_attention_heads * self.head_dim)

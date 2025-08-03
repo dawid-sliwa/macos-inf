@@ -27,31 +27,31 @@ class AsyncLLM:
         )
         eos_id = self.tokenizer.eos_token_id
 
-        # prefill with initial input prompt getting back logits of new token
-        input_tensor = torch.tensor(request_prompt).unsqueeze(0)
-        positions_ids = torch.arange(input_tensor.shape[1]).unsqueeze(0)
+        # 1. PREFILL
+        prompt_ids = torch.tensor(request_prompt).unsqueeze(0)
+        pos_ids = torch.arange(
+            prompt_ids.shape[1],
+        ).unsqueeze(0)
         with torch.no_grad():
-            logits = self.model(input_tensor, positions_ids, True)
+            logits = self.model(prompt_ids, pos_ids, prefill=True)
 
-        logits = logits[:, -1, :]
-        idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        next_id = torch.argmax(logits[:, -1, :], dim=1, keepdim=True)
+        input_ids = torch.cat([prompt_ids, next_id], dim=1)
+        curr_len = input_ids.shape[1]
 
-        input_tensor = torch.cat((input_tensor, idx_next), dim=1)
-        seq_len = input_tensor.shape[1]
+        for _ in range(128):
+            last_token = input_ids[:, -1:]
+            pos_ids = torch.tensor([[curr_len - 1]], device=input_ids.device)
 
-        for idx in range(16):
-            positions_ids = torch.tensor([[seq_len + idx]])
-            input_idx = input_tensor[:, -1].unsqueeze(0)
             with torch.no_grad():
-                logits = self.model(input_idx, positions_ids, False)
+                logits = self.model(last_token, pos_ids, prefill=False)
 
-            logits = logits[:, -1, :]
+            next_id = torch.argmax(logits[:, -1, :], dim=1, keepdim=True)
 
-            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-
-            if idx_next.item() == eos_id:
+            if next_id.item() == eos_id:
                 break
 
-            input_tensor = torch.cat((input_tensor, idx_next), dim=1)
+            input_ids = torch.cat([input_ids, next_id], dim=1)
+            curr_len += 1
 
-        return self.tokenizer.decode(input_tensor.squeeze(0).tolist())
+        return self.tokenizer.decode(input_ids.squeeze(0).tolist())
