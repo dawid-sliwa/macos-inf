@@ -1,3 +1,4 @@
+from typing import List
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -24,6 +25,12 @@ async def create_chat_completion(data: ChatCompletionRequest, request: Request):
     engine = get_engine(request)
 
     return await engine.create_chat_completion(request=data)
+
+@router.post("/v1/test")
+async def test_feat(data: List[ChatCompletionRequest], request: Request):
+    engine = get_engine(request)
+
+    return await engine.test_create_chat_compl(requests=data)
 
 
 def build_app(args: ServerArgs):
