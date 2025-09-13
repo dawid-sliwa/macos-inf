@@ -76,85 +76,8 @@ class AsyncLLM:
             input_ids = torch.cat([input_ids, next_id], dim=1)
             curr_len += 1
 
-        print(input_ids)
-
         return self.tokenizer.decode(input_ids.squeeze(0).tolist())
 
-    async def test_create_chat_compl(self, requests: List[ChatCompletionRequest]):
-        conversations = []
-        for request in requests:
-            conversations.append(request.messages)
 
-        request_prompt = self.tokenizer.apply_chat_template(
-            conversation=conversations,
-            add_generation_prompt=True,
-            enable_thinking=False,
-            padding=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
-        eos_id = self.tokenizer.eos_token_id
-
-        kv_cache1 = KVCache.new(
-            self.config.num_hidden_layers,
-            1024,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-        )
-        kv_cache2 = KVCache.new(
-            self.config.num_hidden_layers,
-            1024,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-        )
-
-        input_ids = request_prompt["input_ids"]
-        input_ids = input_ids.to(DEVICE)
-        attention_mask = request_prompt["attention_mask"]
-
-        lengths = (input_ids != self.tokenizer.pad_token_id).sum(dim=1)
-        bsz, seq_len = input_ids.shape
-
-        position_ids = torch.zeros((bsz, seq_len), dtype=torch.long, device=DEVICE)
-        for b in range(bsz):
-            L = lengths[b].item()
-            position_ids[b, seq_len - L : seq_len] = torch.arange(L, device=DEVICE)
-
-        cache_positions = torch.full(
-            (bsz, seq_len), -1, dtype=torch.long, device=DEVICE
-        )
-        for b in range(bsz):
-            L = lengths[b].item()
-            cache_positions[b, seq_len - L : seq_len] = torch.arange(L, device=DEVICE)
-
-        S = int(lengths.max().item())
-        key_index = torch.arange(S, device=DEVICE).contiguous().view(1, 1, 1, S)
-
-        qpos = position_ids.contiguous().view(bsz, 1, seq_len, 1)
-
-        causal = key_index > qpos
-        src_pad = key_index >= lengths.contiguous().view(bsz, 1, 1, 1)
-
-
-        tgt_pad = (position_ids == 0) & (
-            torch.arange(seq_len, device=DEVICE).unsqueeze(0)
-            < (seq_len - lengths).unsqueeze(1)
-        )
-        tgt_pad = tgt_pad.contiguous().view(bsz, 1, seq_len, 1).expand(bsz, 1, seq_len, S)
-
-        final_mask = ~(causal | src_pad | tgt_pad)
-
-        with torch.no_grad():
-            logits = self.model(
-                input_ids,
-                [kv_cache1, kv_cache2],
-                final_mask,
-                position_ids,
-                cache_positions,
-                True,
-            )
-
-        next_id = torch.argmax(logits[:, -1, :], dim=1, keepdim=True)
-        print(self.tokenizer.decode([next_id[0].item()]), self.tokenizer.decode([next_id[1].item()]))
-
-        return "asd"
+    async def chat_cmpl_continous_batching(self, request: ChatCompletionRequest):
+        pass

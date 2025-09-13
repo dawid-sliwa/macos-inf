@@ -1,5 +1,5 @@
 from enum import StrEnum, auto
-from typing import Optional
+from typing import List, Optional
 from torch import nn
 import torch
 from inference.config.model_config import ModelConfig
@@ -10,6 +10,7 @@ from typing import Union
 
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
+from inference.engine.kv_cache import KVCache
 from inference.model_loader.model_loader import ModelLoader
 
 
@@ -26,6 +27,8 @@ class ForwardBatch:
     batch_of_pos: torch.Tensor
     pos_in_seq: torch.Tensor
     attn_mask: torch.Tensor
+    end_positions: torch.Tensor
+    kv_caches: List[KVCache]
 
 
 def compute_rope_params(
@@ -34,7 +37,11 @@ def compute_rope_params(
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
     inv_freq = 1.0 / (
-        theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype) / head_dim)
+        theta_base
+        ** (
+            torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float()
+            / head_dim
+        )
     )
 
     positions = torch.arange(context_length, dtype=dtype)
@@ -52,20 +59,18 @@ def compute_rope_params(
 def apply_rope(
     x: torch.Tensor, position_embeddings: torch.Tensor, position_ids: torch.Tensor
 ):
+    _, _, head_dim = x.shape
     cos, sin = position_embeddings
 
     cos = cos[position_ids].unsqueeze(0)
     sin = sin[position_ids].unsqueeze(0)
 
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
+    x1 = x[..., : head_dim // 2]
+    x2 = x[..., head_dim // 2 :]
 
-    rot = torch.empty_like(x)
+    rotated = torch.cat((-x2, x1), dim=-1)
 
-    rot[..., 0::2] = -x_odd
-    rot[..., 1::2] = x_even
-
-    return (x * cos) + (rot * sin)
+    return (x * cos) + (rotated * sin)
 
 
 class RMSNorm(nn.Module):
@@ -170,6 +175,37 @@ class Attention(nn.Module):
         queries = apply_rope(queries, position_embeddings, position_ids)
         keys = apply_rope(keys, position_embeddings, position_ids)
 
+        # KVCache here
+        if forward_batch.forward_mode == ForwardMode.PREFILL:
+            for idx, batch_seq_len in enumerate(forward_batch.lengths):
+                r_cache = forward_batch.kv_caches[idx]
+                start = start_offsets[idx]
+                end = end_positions[idx] + 1
+                r_cache.keys[layer_idx, :batch_seq_len] = keys[:, start:end, :].permute(
+                    1, 0, 2
+                )
+                r_cache.values[layer_idx, :batch_seq_len] = values[
+                    :, start:end, :
+                ].permute(1, 0, 2)
+                r_cache.length[0] = batch_seq_len
+        elif forward_batch.forward_mode == ForwardMode.DECODE:
+            gathered_keys = []
+            gathered_values = []
+            for idx, batch_seq_len in enumerate(forward_batch.pos_in_seq):
+                r_cache = forward_batch.kv_caches[idx]
+
+                r_cache.keys[layer_idx, batch_seq_len.item()] = keys[
+                    :, idx : idx + 1, :
+                ].permute(1, 0, 2)
+                r_cache.values[layer_idx, batch_seq_len.item()] = values[
+                    :, idx : idx + 1, :
+                ].permute(1, 0, 2)
+
+                gathered_keys.append(r_cache.keys[layer_idx, : batch_seq_len + 1])
+                gathered_values.append(r_cache.values[layer_idx, : batch_seq_len + 1])
+            keys = torch.cat(gathered_keys, dim=0).transpose(0, 1)
+            values = torch.cat(gathered_values, dim=0).transpose(0, 1)
+
         keys = keys.repeat_interleave(self.num_kv_groups, dim=0)
         values = values.repeat_interleave(self.num_kv_groups, dim=0)
 
@@ -177,7 +213,9 @@ class Attention(nn.Module):
             self.head_dim**-0.5
         )
         matmul_res = matmul_res + forward_batch.attn_mask
-        attn_score = torch.softmax(matmul_res, dim=-1)
+        attn_score = torch.nn.functional.softmax(
+            matmul_res, dim=-1, dtype=torch.float32
+        ).to(dtype=x.dtype)
         attn_output = torch.matmul(attn_score, values)
         attn_output = attn_output.transpose(0, 1).reshape(
             seq_len, self.num_attention_heads * self.head_dim
@@ -305,6 +343,24 @@ tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = (
 requests = [
     {
         "messages": [
+            {
+                "role": "system",
+                "content": "You are helpful assistant, answer user questions",
+            },
+            {"role": "user", "content": "Hello how are you feeling today"},
+        ]
+    },
+    {
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are helpful assistant, answer user questions",
+            },
+            {"role": "user", "content": "Tell me a funny story about a dog."},
+        ]
+    },
+    {
+        "messages": [
             {"role": "user", "content": "Tell me a funny story about cat."},
         ]
     },
@@ -324,7 +380,6 @@ token_ids = tokenizer.apply_chat_template(
 lengths = torch.tensor([len(r) for r in token_ids], dtype=torch.long)
 total_len = int(lengths.sum())
 bsz = lengths.numel()
-print(token_ids)
 start_offsets = torch.zeros(bsz, dtype=torch.long)
 if bsz > 1:
     start_offsets[1:] = torch.cumsum(lengths[:-1], dim=0)
@@ -336,7 +391,6 @@ batch_of_pos = torch.repeat_interleave(torch.arange(bsz, dtype=torch.long), leng
 global_idx = torch.arange(total_len, dtype=torch.long)
 
 pos_in_seq = global_idx - start_offsets[batch_of_pos]
-print(pos_in_seq)
 
 
 same_batch = batch_of_pos[:, None] == batch_of_pos[None, :]
@@ -348,32 +402,135 @@ attn_mask = torch.where(
     torch.zeros((), device=allowed.device),
     torch.full((), float("-inf"), device=allowed.device),
 )
+caches = []
+for _ in lengths:
+    caches.append(
+        KVCache.new(
+            num_hidden_layers=model_config.hf_config.num_hidden_layers,
+            ctx_length=4096,
+            num_kv_heads=model_config.hf_config.num_key_value_heads,
+            head_dim=model_config.hf_config.head_dim,
+        )
+    )
 
-fwd_batch = ForwardBatch(
+end_positions = start_offsets + lengths - 1
+fwd_batch_prefill = ForwardBatch(
     forward_mode=ForwardMode.PREFILL,
     lengths=lengths,
     start_offsets=start_offsets,
     batch_of_pos=batch_of_pos,
     pos_in_seq=pos_in_seq,
     attn_mask=attn_mask,
+    kv_caches=caches,
+    end_positions=end_positions,
 )
+
 
 model_inst = Qwen3ModelInstance(config=model_config)
 loader = ModelLoader()
-loader = loader.load_model(config=model_config, model=model_inst)
+loader.load_model(config=model_config, model=model_inst)
 
-end_positions = (start_offsets + lengths - 1)
-# with torch.no_grad():
-#     logits = model_inst(
-#         input_ids=flat_tokens, position_ids=pos_in_seq, forward_batch=fwd_batch
-#     )
-#     print(logits[start_offsets].shape)
 
-#     next_ids = torch.argmax(logits[end_positions], dim=1, keepdim=True)
-#     print(next_ids)
+new_ids = []
 
-print(tokenizer.decode([39814, 752]))
+with torch.no_grad():
+    logits = model_inst(
+        input_ids=flat_tokens, position_ids=pos_in_seq, forward_batch=fwd_batch_prefill
+    )
 
+    next_ids = torch.argmax(logits[end_positions], dim=1, keepdim=True)
+    print(next_ids)
+    new_ids = next_ids.flatten(-2, 1)
+
+
+sequences, output_seq_len = next_ids.shape
+
+decode_lengths = []
+
+for idx in range(sequences):
+    decode_lengths.append(len(next_ids[idx]))
+decode_lengths = torch.tensor(decode_lengths)
+bsz = decode_lengths.numel()
+
+start_offsets_decode = torch.zeros(bsz, dtype=torch.long)
+if bsz > 1:
+    start_offsets_decode[1:] = torch.cumsum(decode_lengths[:-1], dim=0)
+
+# for idx in range(len(lengths)):
+#     lengths[idx] += 1
+
+# batch_of_pos_decode = torch.tensor([0, 1, 2])
+# batch_of_pos_keys = torch.repeat_interleave(
+#     torch.arange(bsz, dtype=torch.long), lengths
+# )
+
+# allowed = batch_of_pos_decode[:, None] == batch_of_pos_keys[None, :]
+
+# attn_mask_decode = torch.where(
+#     allowed,
+#     torch.zeros((), device=allowed.device),
+#     torch.full((), float("-inf"), device=allowed.device),
+# )
+# pos_in_seq_decode = lengths - 1
+
+# fwd_batch_decode = ForwardBatch(
+#     forward_mode=ForwardMode.DECODE,
+#     lengths=decode_lengths,
+#     start_offsets=start_offsets_decode,
+#     batch_of_pos=batch_of_pos_decode,
+#     pos_in_seq=pos_in_seq_decode,
+#     kv_caches=caches,
+#     attn_mask=attn_mask_decode,
+#     end_positions=end_positions,
+# )
+
+with torch.no_grad():
+    # logits = model_inst(
+    #     input_ids=new_ids,
+    #     position_ids=pos_in_seq_decode,
+    #     forward_batch=fwd_batch_decode,
+    # )
+
+    # next_ids = torch.argmax(logits, dim=1, keepdim=True)
+    new_ids = next_ids.flatten(-2, 1)
+    res = []
+
+    for _ in range(32):
+        for idx in range(len(lengths)):
+            lengths[idx] += 1
+
+        batch_of_pos_decode = torch.tensor([0, 1, 2])
+        batch_of_pos_keys = torch.repeat_interleave(
+            torch.arange(bsz, dtype=torch.long), lengths
+        )
+
+        allowed = batch_of_pos_decode[:, None] == batch_of_pos_keys[None, :]
+
+        attn_mask_decode = torch.where(
+            allowed,
+            torch.zeros((), device=allowed.device),
+            torch.full((), float("-inf"), device=allowed.device),
+        )
+        pos_in_seq_decode = lengths - 1
+        print(pos_in_seq_decode)
+        fwd_batch_decode = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            lengths=decode_lengths,
+            start_offsets=start_offsets_decode,
+            batch_of_pos=batch_of_pos_decode,
+            pos_in_seq=pos_in_seq_decode,
+            kv_caches=caches,
+            attn_mask=attn_mask_decode,
+            end_positions=end_positions,
+        )
+        logits = model_inst(
+            input_ids=new_ids,
+            position_ids=pos_in_seq_decode,
+            forward_batch=fwd_batch_decode,
+        )
+        next_ids = torch.argmax(logits, dim=1, keepdim=True)
+        new_ids = next_ids.flatten(-2, 1)
+        print(next_ids)
 
 # [[ 39814,      0,   5692,    594,    264,  15173,   3364,
 #             911,    264,   8251,   1447,  12522,   5193,    264,    882,     11,

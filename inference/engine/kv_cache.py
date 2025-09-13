@@ -9,7 +9,7 @@ DEVICE = "cpu"
 class KVCache:
     keys: torch.Tensor
     values: torch.Tensor
-    length: torch.Tensor
+    length: torch.LongTensor
 
     @classmethod
     def new(
@@ -22,5 +22,5 @@ class KVCache:
             values=torch.zeros(
                 (num_hidden_layers, ctx_length, num_kv_heads, head_dim), device=DEVICE
             ),
-            length=torch.tensor([0], device=DEVICE),
+            length=torch.tensor([0], dtype=torch.long, device=DEVICE),
         )
