@@ -1,13 +1,23 @@
+from contextlib import asynccontextmanager
+import json
+import time
+import traceback
+from typing import List
+import uuid
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import uvicorn
 
 from inference.config.model_config import ModelConfig
 from inference.engine.async_llm import AsyncLLM
 from inference.openai_protocol import ChatCompletionRequest
 from inference.server_args import ServerArgs
+import logging
 
 router = APIRouter()
+
+logging.basicConfig(level=logging.INFO)
 
 
 def get_engine(request: Request) -> AsyncLLM:
@@ -19,15 +29,74 @@ async def health_route():
     return {"status": "ok"}
 
 
-@router.post("/v1/chat")
-async def create_chat_completion(data: ChatCompletionRequest, request: Request):
-    engine = get_engine(request)
+async def stream_response(engine: AsyncLLM, data: ChatCompletionRequest):
+    request_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(time.time())
+    yield f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': created, 'model': 'test', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+    response = engine.chat_cmpl_continous_batching(request=data)
 
-    return await engine.create_chat_completion(request=data)
+    async for token in response:
+        chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": "test",
+            "choices": [
+                {"index": 0, "delta": {"content": token}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(chunk)} \n\n"
+
+    final_chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": "test",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def non_stream_response(engine: AsyncLLM, data: ChatCompletionRequest):
+    data = engine.chat_cmpl_continous_batching(request=data)
+    response = ""
+    async for token in data:
+        response += token
+
+    return response
+
+
+@router.post("/v1/chat/completions")
+async def create_chat_completion(data: ChatCompletionRequest, request: Request):
+    print("got request", request.body)
+    engine = get_engine(request)
+    try:
+        if data.stream:
+            return StreamingResponse(
+                stream_response(engine=engine, data=data),
+                media_type="text/event-stream",
+            )
+        else:
+            return await non_stream_response(engine=engine, data=data)
+    except Exception:
+        traceback.print_exc()
 
 
 def build_app(args: ServerArgs):
-    app = FastAPI(title="Macos inf")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        config = ModelConfig(model_path=args.model_path)
+
+        engine = AsyncLLM(model_config=config)
+        app.state.engine = engine
+        engine.start()
+        try:
+            yield
+        finally:
+            engine.stop()
+
+    app = FastAPI(title="Macos inf", lifespan=lifespan)
 
     app.include_router(router=router)
     app.add_middleware(
@@ -39,10 +108,6 @@ def build_app(args: ServerArgs):
     )
     app.server_args = args
 
-    config = ModelConfig(model_path=args.model_path)
-
-    engine = AsyncLLM(model_config=config)
-    app.state.engine = engine
     return app
 
 

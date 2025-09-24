@@ -1,8 +1,31 @@
-from typing import Optional
+from dataclasses import dataclass
+from enum import StrEnum, auto
+from typing import List, Optional
 from torch import nn
 import torch
 from inference.config.model_config import ModelConfig
 from transformers import AutoConfig
+
+from inference.engine.kv_cache import KVCache
+
+
+
+class ForwardMode(StrEnum):
+    PREFILL = auto()
+    DECODE = auto()
+
+
+@dataclass
+class ForwardBatch:
+    forward_mode: ForwardMode
+    lengths: torch.Tensor
+    start_offsets: torch.Tensor
+    batch_of_pos: torch.Tensor
+    pos_in_seq: torch.Tensor
+    attn_mask: torch.Tensor
+    kv_caches: List[KVCache]
+    end_positions: Optional[torch.Tensor] = None
+
 
 
 def compute_rope_params(
@@ -33,18 +56,15 @@ def compute_rope_params(
 def apply_rope(
     x: torch.Tensor, position_embeddings: torch.Tensor, position_ids: torch.Tensor
 ):
+    _, _, head_dim = x.shape
     cos, sin = position_embeddings
 
-    cos = cos[position_ids]
-    sin = sin[position_ids]
-
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-
-    head_dim = x.size(-1)
+    cos = cos[position_ids].unsqueeze(0)
+    sin = sin[position_ids].unsqueeze(0)
 
     x1 = x[..., : head_dim // 2]
     x2 = x[..., head_dim // 2 :]
+
     rotated = torch.cat((-x2, x1), dim=-1)
 
     return (x * cos) + (rotated * sin)
@@ -110,31 +130,41 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
+    def _prefill(
+        self,
+        x: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        layer_idx: int,
+        forward_batch: ForwardBatch,
+    ):
+        pass
+
+    def _decode(self):
+        pass
+
     def forward(
         self,
         x: torch.Tensor,
+        position_ids: torch.Tensor,
         layer_idx: int,
         position_embeddings: torch.Tensor,
-        cache: tuple[torch.Tensor, torch.Tensor],
-        position_ids: torch.Tensor,
-        prefill: Optional[bool] = False,
-    ):
-        bsz, seq_len, _ = x.shape  # shape [batch_size, seq_len, hidden_dim]
-        k_cache, v_cache = cache
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        seq_len, _ = x.shape  # shape [seq_len, hidden_dim]
 
-        queries = self.q_proj(x)  # shape [batch_size, seq_len, num_heads, head_dim]
-        keys = self.k_proj(x)  # shape [batch_size, seq_len, num_kv_heads, head_dim]
-        values = self.v_proj(x)  # shape [batch_size, seq_len, num_kv_heads, head_dim]
+        queries = self.q_proj(x)  # shape [seq_len, hidden_dim]
+        keys = self.k_proj(x)  # shape [seq_len, hidden_dim]
+        values = self.v_proj(x)  # shape [seq_len, hidden_dim]
 
-        queries = queries.view(
-            bsz, seq_len, self.num_attention_heads, self.head_dim
-        ).transpose(1, 2)  # shape [batch_size, num_heads, seq_len, head_dim]
-        keys = keys.view(
-            bsz, seq_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)  # shape [batch_size, num_kv_heads, seq_len, head_dim]
-        values = values.view(
-            bsz, seq_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)  # shape [batch_size, num_kv_heads, seq_len, head_dim]
+        queries = queries.reshape(
+            seq_len, self.num_attention_heads, self.head_dim
+        ).transpose(0, 1)  # shape [num_heads, seq_len, head_dim]
+        keys = keys.reshape(seq_len, self.num_key_value_heads, self.head_dim).transpose(
+            0, 1
+        )  # shape [num_kv_heads, seq_len, head_dim]
+        values = values.reshape(
+            seq_len, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 1)  # shape [num_kv_heads, seq_len, head_dim]
 
         queries = self.q_norm(queries)
         keys = self.k_norm(keys)
@@ -142,26 +172,50 @@ class Attention(nn.Module):
         queries = apply_rope(queries, position_embeddings, position_ids)
         keys = apply_rope(keys, position_embeddings, position_ids)
 
-        if prefill:
-            k_cache[layer_idx, :bsz, :seq_len] = keys.permute(0, 2, 1, 3)
-            v_cache[layer_idx, :bsz, :seq_len] = values.permute(0, 2, 1, 3)
-        else:
-            cur_pos = int(position_ids[0].item())
-            k_cache[layer_idx, :bsz, cur_pos] = keys.squeeze(2)
-            v_cache[layer_idx, :bsz, cur_pos] = values.squeeze(2)
+        # KVCache here
+        if forward_batch.forward_mode == ForwardMode.PREFILL:
+            for idx, batch_seq_len in enumerate(forward_batch.lengths):
+                r_cache = forward_batch.kv_caches[idx]
+                start = forward_batch.start_offsets[idx]
+                end = forward_batch.end_positions[idx] + 1
+                r_cache.keys[layer_idx, :batch_seq_len] = keys[:, start:end, :].permute(
+                    1, 0, 2
+                )
+                r_cache.values[layer_idx, :batch_seq_len] = values[
+                    :, start:end, :
+                ].permute(1, 0, 2)
+                r_cache.length[0] = batch_seq_len
+        elif forward_batch.forward_mode == ForwardMode.DECODE:
+            gathered_keys = []
+            gathered_values = []
+            for idx, batch_seq_len in enumerate(forward_batch.pos_in_seq):
+                r_cache = forward_batch.kv_caches[idx]
 
-            keys = k_cache[layer_idx, :bsz, : cur_pos + 1].permute(0, 2, 1, 3)
-            values = v_cache[layer_idx, :bsz, : cur_pos + 1].permute(0, 2, 1, 3)
+                r_cache.keys[layer_idx, batch_seq_len.item()] = keys[
+                    :, idx : idx + 1, :
+                ].permute(1, 0, 2)
+                r_cache.values[layer_idx, batch_seq_len.item()] = values[
+                    :, idx : idx + 1, :
+                ].permute(1, 0, 2)
 
-        keys = keys.repeat_interleave(self.num_kv_groups, dim=1)
-        values = values.repeat_interleave(self.num_kv_groups, dim=1)
+                gathered_keys.append(r_cache.keys[layer_idx, : batch_seq_len + 1])
+                gathered_values.append(r_cache.values[layer_idx, : batch_seq_len + 1])
+            keys = torch.cat(gathered_keys, dim=0).transpose(0, 1)
+            values = torch.cat(gathered_values, dim=0).transpose(0, 1)
 
-        attn_output = (
-            torch.nn.functional.scaled_dot_product_attention(
-                queries, keys, values, attn_mask=None, is_causal=prefill
-            )
-            .transpose(1, 2)
-            .reshape(bsz, seq_len, self.num_attention_heads * self.head_dim)
+        keys = keys.repeat_interleave(self.num_kv_groups, dim=0)
+        values = values.repeat_interleave(self.num_kv_groups, dim=0)
+
+        matmul_res = torch.matmul(queries, keys.transpose(-2, -1)) * (
+            self.head_dim**-0.5
+        )
+        matmul_res = matmul_res + forward_batch.attn_mask
+        attn_score = torch.nn.functional.softmax(
+            matmul_res, dim=-1, dtype=torch.float32
+        ).to(dtype=x.dtype)
+        attn_output = torch.matmul(attn_score, values)
+        attn_output = attn_output.transpose(0, 1).reshape(
+            seq_len, self.num_attention_heads * self.head_dim
         )
 
         return self.o_proj(attn_output)
@@ -184,16 +238,19 @@ class Qwen3DecoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        cache: tuple[torch.Tensor, torch.Tensor],
         position_ids: torch.Tensor,
-        prefill: Optional[bool] = False,
+        position_embeddings: torch.Tensor,
+        forward_batch: ForwardBatch,
     ):
         residual = x
         x = self.input_layernorm(x)
 
         x = self.self_attn(
-            x, self.idx, position_embeddings, cache, position_ids, prefill
+            x=x,
+            position_ids=position_ids,
+            layer_idx=self.idx,
+            position_embeddings=position_embeddings,
+            forward_batch=forward_batch,
         )
         x = residual + x
 
@@ -231,49 +288,21 @@ class Qwen3Model(nn.Module):
             context_length=self.config.max_position_embeddings,
         )
 
-        self.register_buffer(
-            "k_cache",
-            torch.zeros(
-                (
-                    self.config.num_hidden_layers,
-                    1,
-                    self.config.max_position_embeddings,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                )
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "v_cache",
-            torch.zeros(
-                (
-                    self.config.num_hidden_layers,
-                    1,
-                    self.config.max_position_embeddings,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                )
-            ),
-            persistent=False,
-        )
-
     def forward(
         self,
-        in_idx,
+        input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        prefill: Optional[bool] = False,
+        forward_batch: ForwardBatch,
     ):
-        token_embeddings = self.embed_tokens(in_idx)
+        token_embeddings = self.embed_tokens(input_ids)
         x = token_embeddings
 
         for layer in self.layers:
             x = layer(
-                x,
-                self.position_embeddings,
-                (self.k_cache, self.v_cache),
-                position_ids,
-                prefill,
+                x=x,
+                position_embeddings=self.position_embeddings,
+                position_ids=position_ids,
+                forward_batch=forward_batch,
             )
 
         x = self.norm(x)
@@ -290,8 +319,13 @@ class Qwen3ModelInstance(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
-        position_ids: torch.Tensor,
-        prefill: Optional[bool] = False,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.LongTensor],
+        forward_batch: ForwardBatch,
     ):
-        return self.model(idx, position_ids, prefill)
+        return self.model(
+            input_ids,
+            position_ids,
+            forward_batch,
+        )
+

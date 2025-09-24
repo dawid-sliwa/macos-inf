@@ -7,7 +7,7 @@ from typing import List
 class ServerArgs:
     model_path: str
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 4444
 
     @staticmethod
     def add_args(parser: ArgumentParser):

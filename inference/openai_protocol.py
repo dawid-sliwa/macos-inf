@@ -10,3 +10,4 @@ class ChatCompletionMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     messages: List[ChatCompletionMessage]
     sampling_params: Optional[dict] = None
+    stream: Optional[bool] = False
