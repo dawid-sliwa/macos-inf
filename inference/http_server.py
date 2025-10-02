@@ -2,7 +2,6 @@ from contextlib import asynccontextmanager
 import json
 import time
 import traceback
-from typing import List
 import uuid
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,17 +58,37 @@ async def stream_response(engine: AsyncLLM, data: ChatCompletionRequest):
 
 
 async def non_stream_response(engine: AsyncLLM, data: ChatCompletionRequest):
+    request_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(time.time())
+    choices = {}
+    choices[0] = {
+        "index": 0,
+        "message": {"role": "assistant", "content": ""},
+        "finish_reason": None,
+    }
     data = engine.chat_cmpl_continous_batching(request=data)
-    response = ""
-    async for token in data:
-        response += token
 
-    return response
+    async for token in data:
+        choices[0]["message"]["content"] += token
+
+    choices[0]["finish_reason"] = "stop"
+
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": "test",
+        "choices": list(choices.values()),
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
 
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(data: ChatCompletionRequest, request: Request):
-    print("got request", request.body)
     engine = get_engine(request)
     try:
         if data.stream:
