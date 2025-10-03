@@ -1,6 +1,6 @@
 [project]
 name = "macos-serving"
-version = "0.1.0"
+version = "0.1.1"
 description = "Simple LLM continous batching engine implementation with support for optimized macos-inference"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,10 @@ dependencies = [
     "uvicorn>=0.34.2",
     "uvloop>=0.21.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/dawid-sliwa/macos-inf"
+
 
 [build-system]
 requires = ["hatchling>=1.18"]

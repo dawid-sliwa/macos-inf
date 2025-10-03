@@ -34,6 +34,7 @@ messages = [
 response = client.chat.completions.create(messages=messages, model="w/e")
 print(response)
 ```
+Oh and right now there is no sophisticated sampling implemented, during decoding next token is just sampled using argmax from logits.
 
 For now this is just an experimental-exploration project in future there is a plan to further optimize it and play around with metal kernes.
 
